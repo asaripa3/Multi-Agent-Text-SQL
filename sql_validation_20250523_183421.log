@@ -1,0 +1,9 @@
+Normalized Gold: select cast(sum(case when `currency` = eur then 1 else 0 end) as double) / sum(case when `currency` = czk then 1 else 0 end) from `customers`
+Normalized Generated: select cast(count(distinct case when customers.currency = eur then transactions_1k.customer_id end) as float) / nullif(count(distinct case when customers.currency = czk then transactions_1k.customer_id end), 0) as ratio from customers join transactions_1k on customers.customer_id = transactions_1k.customer_id
+Match: INCORRECT
+Normalized Gold: select `t1`.`customerid` from `customers` as `t1` inner join `yearmonth` as `t2` on `t1`.`customerid` = `t2`.`customerid` where `t1`.`segment` = lam and substr(`t2`.`date`, 1, 4) = 2012 group by `t1`.`customerid` order by sum(`t2`.`consumption`) asc limit 1
+Normalized Generated: select c.first_name, c.last_name, sum(y.consumption) as total_consumption from customers c join yearmonth y on c.customer_id = y.customer_id where extract(year from y.date) = 2012 and extract(quarter from y.date) = 4 group by c.first_name, c.last_name order by total_consumption asc nulls last limit 1
+Match: INCORRECT
+Normalized Gold: select avg(`t2`.`consumption`) / 12 from `customers` as `t1` inner join `yearmonth` as `t2` on `t1`.`customerid` = `t2`.`customerid` where substr(`t2`.`date`, 1, 4) = 2013 and `t1`.`segment` = sme
+Normalized Generated: select extract(month from yearmonth.date) as month, extract(year from yearmonth.date) as year, avg(yearmonth.consumption) as average_consumption from yearmonth where yearmonth.customer_id in (select customer_segment.customer_id from customers join customer_segment on customers.client_segment = customer_segment.segment where customers.customer_segment = sme) and extract(year from yearmonth.date) = 2013 group by month, year order by month asc, year asc
+Match: INCORRECT

@@ -1,3 +1,8 @@
+def extract_json_block(text):
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not match:
+        raise ValueError("Could not extract JSON block from validation content.")
+    return json.loads(match.group(1))
 """
 Main script for running the SQL multi-agent pipeline.
 """
@@ -9,7 +14,12 @@ from autogen import UserProxyAgent, GroupChat, GroupChatManager
 from agents.question_analyzer import QuestionAnalyzer
 from agents.sql_generator import SQLGenerator
 from agents.query_validator import QueryValidator
-from llm_config import get_llm_config
+from llm_config import get_llm_config, get_sqlcoder_config
+from planning.agent_step import AgentStep
+from planning.planner import Planner
+from agents.fallback_sql_generator import FallbackSQLGenerator
+from control.validator_hooks import should_run_fallback, inject_fallback_step
+from state.shared_state import reset_state, update_state, get_state, get_full_state, get_state_reference
 
 # Set up logging
 # Create a custom logger
@@ -128,107 +138,125 @@ def load_questions():
             'db_id': q['db_id']
         } for i, q in enumerate(questions, 1)]
 
-def extract_sql_from_message(content):
-    """Extract SQL query from a message content using multiple patterns."""
-    # Pattern 1: Look for SQL between triple backticks
-    sql_match = re.search(r'```sql\n(.*?)\n```', content, re.DOTALL)
-    if sql_match:
-        return sql_match.group(1).strip()
-    
-    # Pattern 2: Look for SQL between single backticks
-    sql_match = re.search(r'`(SELECT.*?)`', content, re.DOTALL)
-    if sql_match:
-        return sql_match.group(1).strip()
-    
-    # Pattern 3: Look for SQL starting with SELECT
-    sql_match = re.search(r'(SELECT.*?)(?:;|$)', content, re.IGNORECASE | re.DOTALL)
-    if sql_match:
-        return sql_match.group(1).strip()
-    
+import re
+
+def extract_sql_from_message(content: str) -> str:
+    # Try to match ```sql ... ``` first
+    match = re.search(r"```sql\s*(.*?)```", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # Try plain triple backticks
+    match = re.search(r"```\s*(.*?)```", content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # Try SELECT-fallback pattern
+    match = re.search(r"(SELECT .*?);", content, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
     return None
 
-def process_question(question_data, llm_config):
-    """Process a single question through the agent pipeline."""
-    # Load the corresponding schema using db_id
-    full_schema = load_schema(question_data['db_id'])
-    
-    # Extract relevant schema parts
-    schema = extract_relevant_schema(full_schema, question_data['question'])
-    
-    # Create user proxy
-    user_proxy = UserProxyAgent(
-        name="User",
-        human_input_mode="NEVER",
-        max_consecutive_auto_reply=0,
-        llm_config=llm_config
-    )
-    
-    # Create agents with more focused system messages
-    question_analyzer = QuestionAnalyzer(llm_config)
-    sql_generator = SQLGenerator(llm_config)
-    query_validator = QueryValidator(llm_config)
-    
-    # Create group chat with shorter max_round
-    groupchat = GroupChat(
-        agents=[user_proxy, question_analyzer, sql_generator, query_validator],
-        messages=[],
-        max_round=5,  # Reduced from 10 to 5
-        speaker_selection_method="round_robin",
-        allow_repeat_speaker=False
-    )
-    
-    # Create group chat manager
-    manager = GroupChatManager(
-        groupchat=groupchat,
-        llm_config=llm_config
-    )
-    
-    # Prepare the question with minimal context, without showing the gold SQL
-    question = f"""Question: {question_data['question']}
+def validate_sql_with_agent(query: str, schema: str, llm_config: dict) -> dict:
+    validator = QueryValidator(llm_config)
+    prompt = f"""You are given a SQL query and schema. Validate the query.
+SQL Query:
+```sql
+{query}
+```
 
 Schema:
+```sql
 {schema}
+```
 
-Please analyze the question and generate a valid SQL query."""
-    
-    # Start the conversation
-    chat_result = user_proxy.initiate_chat(
-        manager,
-        message=question
-    )
-    
-    # Extract the final SQL query from the conversation
+Respond in JSON:
+{{
+  "is_valid": true,
+  "final_query": "...",
+  "suggestions": []
+}}"""
+    response = validator.generate_reply(messages=[{"role": "user", "content": prompt}])
+    raw = response if isinstance(response, str) else json.dumps(response)
+    cleaned = re.sub(r"```json|```", "", raw).strip()
+    return json.loads(cleaned)
+
+def run_fallback_phase(schema, analysis, validation_result, sql_config, llm_config):
+    logger.warning("⚠️ Running fallback due to validation failure...")
+    fallback_agent = FallbackSQLGenerator(sql_config)
+    fallback_state = {
+        "schema": schema,
+        "analysis": analysis,
+        "validation_result": validation_result
+    }
+    result = fallback_agent.run(fallback_state)
+    fallback_query = result.get("final_query")
+
+    if not fallback_query:
+        logger.error("❌ Fallback failed to generate a valid SQL.")
+        return None
+
+    validation = validate_sql_with_agent(fallback_query, schema, llm_config)
+    if validation.get("is_valid"):
+        logger.info("✅ Fallback query validated successfully.")
+        return validation.get("final_query")
+    else:
+        logger.error("❌ Fallback query also failed validation.")
+        return None
+
+def process_question(question_data, llm_config, sql_config):
+    reset_state()
+    full_schema = load_schema(question_data["db_id"])
+    schema = extract_relevant_schema(full_schema, question_data["question"])
+
+    update_state("question", question_data["question"])
+    update_state("schema", schema)
+
+    steps = [
+        AgentStep("QuestionAnalysis", QuestionAnalyzer(llm_config), ["question", "schema"], ["analysis"]),
+        AgentStep("SQLGeneration", SQLGenerator(sql_config), ["question", "schema", "analysis"], ["sql_query"]),
+        AgentStep("QueryValidation", QueryValidator(llm_config), ["sql_query", "schema"], ["validation_result"])
+    ]
+
+    planner = Planner(steps)
+    planner.run(get_state_reference())
+
+    analysis = get_state("analysis")
+    sql_query = get_state("sql_query")
+    validation_result = get_state("validation_result")
+    final_query = get_state("final_query")
+
+    # Parse validation result
     final_query = None
-    for message in reversed(chat_result.chat_history):
-        # Check both assistant and user messages
-        if message['role'] in ['assistant', 'user']:
-            sql = extract_sql_from_message(message['content'])
-            if sql:
-                final_query = sql
-                break
-    
+    try:
+        parsed = extract_json_block(validation_result.get("content", ""))
+
+        if parsed.get("is_valid"):
+            final_query = parsed.get("final_query") or sql_query
+        else:
+            final_query = run_fallback_phase(schema, analysis, parsed, sql_config, llm_config)
+    except Exception as e:
+        pass
+
     # Compare the generated query with the gold SQL
     if final_query:
         normalized_gold = normalize_sql(question_data['gold_sql'])
         normalized_generated = normalize_sql(final_query)
         is_match = normalized_gold == normalized_generated
-        
-        # Log only the essential comparison information
-        logger.info(f"Question {question_data['question_id']}:")
+
         logger.info(f"Normalized Gold: {normalized_gold}")
         logger.info(f"Normalized Generated: {normalized_generated}")
         logger.info(f"Match: {'CORRECT' if is_match else 'INCORRECT'}")
-        logger.info("-" * 80)
-        
+
         return is_match
     else:
-        logger.info(f"Question {question_data['question_id']}: NO SQL GENERATED")
-        logger.info("-" * 80)
         return False
 
 def main():
     # Get LLM configuration
     llm_config = get_llm_config()
+    sql_config = get_sqlcoder_config()
     
     # Load all questions
     questions = load_questions()
@@ -245,7 +273,7 @@ def main():
         print("-" * 80)
         
         try:
-            is_match = process_question(question_data, llm_config)
+            is_match = process_question(question_data, llm_config, sql_config)
             if is_match:
                 correct_matches += 1
         except Exception as e:
@@ -261,4 +289,4 @@ def main():
     logger.info(f"Accuracy: {accuracy:.2f}%")
 
 if __name__ == "__main__":
-    main() 
+    main()

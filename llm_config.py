@@ -18,6 +18,18 @@ def get_llm_config():
         "cache_seed": None
     }
 
+def get_sqlcoder_config():
+    return {
+        "config_list": [{
+            "base_url": "http://localhost:11434",
+            "model": "sqlcoder:7b",
+            "api_type": "ollama"
+        }],
+        "temperature": 0.1,
+        "timeout": 120,
+        "cache_seed": None
+    }
+
 # def get_llm_config():
 #     return {
 #         "config_list": [{

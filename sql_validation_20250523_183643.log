@@ -1,0 +1,3 @@
+Normalized Gold: select cast(sum(case when `currency` = eur then 1 else 0 end) as double) / sum(case when `currency` = czk then 1 else 0 end) from `customers`
+Normalized Generated: select cast(count(distinct case when customers.currency = eur then transactions_1k.customer_id end) as float) / nullif(count(distinct case when customers.currency = czk then transactions_1k.customer_id end), 0) as ratio from customers join transactions_1k on customers.customer_id = transactions_1k.customer_id
+Match: INCORRECT
